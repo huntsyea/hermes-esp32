@@ -1,8 +1,8 @@
 name: xiaozhi-companion
 label: Xiaozhi Companion
 kind: platform
-version: 0.2.0
+version: 0.3.0
 description: >
-  Secure Hermes Platform Adapter and protocol harness for the
-  Xiaozhi-compatible ESP32 companion device.
+  Secure Hermes Platform Adapter with bounded Ogg Opus push-to-talk support
+  for the Xiaozhi-compatible ESP32 companion device.
 author: ESP32 Companion contributors

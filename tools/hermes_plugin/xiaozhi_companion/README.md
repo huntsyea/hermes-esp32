@@ -8,6 +8,12 @@ an explicit in-memory loopback transport, and a deterministic desktop Protocol
 Harness. Ticket 07 adds a production WSS listener through the public
 `websockets` 15 API. It does not modify Hermes core.
 
+Ticket 08 packages each bounded push-to-talk capture as Ogg Opus, caches it
+through the public Hermes media API, and emits one `VOICE` event with an
+`audio/ogg` local path. This lets the standard Hermes automatic STT path
+process the recording. The resulting transcript is sent to the active device
+session as Xiaozhi `stt` JSON.
+
 Production configuration uses `extra.transport: wss`. Set `bind_host`, `port`,
 and `path`, and set absolute external paths in `cert_file`, `key_file`, and
 `device_tokens_file`. The token file is a JSON object keyed by the exact
@@ -34,6 +40,6 @@ No credential or certificate is compiled into the firmware.
 
 The following work is intentionally outside this slice:
 
-- Opus decoding, audio-file creation, and production STT
+- Live STT-provider validation with a configured Hermes service
 - Hermes installation or service configuration
 - Device flashing and physical audio validation

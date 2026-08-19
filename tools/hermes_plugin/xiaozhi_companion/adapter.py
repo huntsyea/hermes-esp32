@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import secrets
+from typing import Any, Callable, Dict, Optional
 
 from gateway.config import Platform
 from gateway.platforms.base import (
@@ -10,9 +11,11 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_audio_from_bytes,
 )
 
 from .network import FileTokenResolver, ListenerConfig, ListenerPolicyError, WebsocketListener
+from .ogg_opus import packets_to_ogg_opus
 from .protocol import VoiceMessage, XiaozhiProtocolServer
 
 
@@ -29,8 +32,19 @@ def _bearer_token(value: str) -> str:
 class XiaozhiCompanionAdapter(BasePlatformAdapter):
     """Bridge protocol sessions to the standard Hermes message boundary."""
 
-    def __init__(self, config, *, session_id_factory=None):
+    def __init__(
+        self,
+        config,
+        *,
+        session_id_factory=None,
+        ogg_serial_factory: Callable[[], int] | None = None,
+        audio_cache: Callable[..., str] | None = None,
+    ):
         super().__init__(config=config, platform=Platform(PLATFORM_NAME))
+        self._ogg_serial_factory = ogg_serial_factory or (
+            lambda: secrets.randbits(32)
+        )
+        self._audio_cache = audio_cache or cache_audio_from_bytes
         extra = getattr(config, "extra", {}) or {}
         self._transport_mode = str(extra.get("transport", "")).strip().lower()
         self._listener = None
@@ -112,6 +126,14 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
         }
 
     async def _handle_voice_message(self, recording: VoiceMessage) -> None:
+        ogg_audio = packets_to_ogg_opus(
+            recording.frames,
+            serial=self._ogg_serial_factory(),
+            input_sample_rate=recording.audio_params.sample_rate,
+            channels=recording.audio_params.channels,
+            frame_duration_ms=recording.audio_params.frame_duration,
+        )
+        cached_audio = self._audio_cache(ogg_audio, ext=".ogg")
         source = self.build_source(
             chat_id=recording.device_id,
             chat_name="alain00",
@@ -126,6 +148,8 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
                 source=source,
                 user_id=recording.device_id,
                 user_name="alain00",
+                media_urls=[cached_audio],
+                media_types=["audio/ogg"],
                 raw_message=recording,
                 metadata={
                     "xiaozhi_session_id": recording.session_id,

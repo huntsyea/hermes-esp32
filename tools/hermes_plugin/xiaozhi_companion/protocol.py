@@ -94,6 +94,7 @@ class XiaozhiProtocolServer:
         session_id_factory: SessionIdFactory | None = None,
         max_frame_bytes: int = 16 * 1024,
         max_recording_bytes: int = 4 * 1024 * 1024,
+        max_recording_frames: int = 5000,
     ):
         if bool(expected_token) == bool(token_resolver):
             raise ValueError("exactly_one_token_source_required")
@@ -105,6 +106,7 @@ class XiaozhiProtocolServer:
         )
         self._max_frame_bytes = max_frame_bytes
         self._max_recording_bytes = max_recording_bytes
+        self._max_recording_frames = max_recording_frames
         self._sessions_by_device: dict[str, XiaozhiSession] = {}
         self._open_lock = asyncio.Lock()
 
@@ -140,6 +142,7 @@ class XiaozhiProtocolServer:
             client_id=client_id,
             max_frame_bytes=self._max_frame_bytes,
             max_recording_bytes=self._max_recording_bytes,
+            max_recording_frames=self._max_recording_frames,
         )
         async with self._open_lock:
             previous = self._sessions_by_device.get(device_id)
@@ -187,6 +190,7 @@ class XiaozhiSession:
         client_id: str,
         max_frame_bytes: int,
         max_recording_bytes: int,
+        max_recording_frames: int,
     ):
         self._server = server
         self._transport = transport
@@ -195,6 +199,7 @@ class XiaozhiSession:
         self.client_id = client_id
         self._max_frame_bytes = max_frame_bytes
         self._max_recording_bytes = max_recording_bytes
+        self._max_recording_frames = max_recording_frames
         self._active = True
         self._negotiated = False
         self._listening = False
@@ -247,6 +252,8 @@ class XiaozhiSession:
             self._fail("audio_frame_too_large")
         if self._recording_bytes + len(payload) > self._max_recording_bytes:
             self._fail("recording_too_large")
+        if len(self._frames) >= self._max_recording_frames:
+            self._fail("too_many_audio_frames")
         self._frames.append(payload)
         self._recording_bytes += len(payload)
 

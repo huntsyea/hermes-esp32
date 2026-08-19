@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -319,6 +320,7 @@ class XiaozhiHermesPluginContractTests(unittest.TestCase):
 import asyncio
 import importlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from gateway.platform_registry import PlatformEntry, platform_registry
@@ -400,7 +402,7 @@ async def main():
         "state": "start",
         "mode": "manual",
     }))
-    await session.receive_binary(b"fixture")
+    await session.receive_binary(b"\xf8\xff\xfe")
     await session.receive_text(json.dumps({
         "session_id": session.session_id,
         "type": "listen",
@@ -410,7 +412,10 @@ async def main():
     assert events[0].message_type.value == "voice"
     assert events[0].source.chat_id == "aa:bb:cc:dd:ee:ff"
     assert events[0].metadata["xiaozhi_session_id"] == session.session_id
-    assert events[0].raw_message.frames == (b"fixture",)
+    assert events[0].raw_message.frames == (b"\xf8\xff\xfe",)
+    assert events[0].media_types == ["audio/ogg"]
+    assert len(events[0].media_urls) == 1
+    assert Path(events[0].media_urls[0]).read_bytes().startswith(b"OggS")
     await adapter.disconnect()
     print(json.dumps({
         "registered": context.entry.name,
@@ -421,19 +426,21 @@ async def main():
 
 asyncio.run(main())
 '''
-        environment = os.environ.copy()
-        environment["PYTHONPATH"] = os.pathsep.join(
-            (str(PLUGIN_PARENT), str(HERMES_ROOT))
-        )
-        completed = subprocess.run(
-            [str(HERMES_PYTHON), "-c", script],
-            cwd=ROOT,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory() as hermes_home:
+            environment = os.environ.copy()
+            environment["HERMES_HOME"] = hermes_home
+            environment["PYTHONPATH"] = os.pathsep.join(
+                (str(PLUGIN_PARENT), str(HERMES_ROOT))
+            )
+            completed = subprocess.run(
+                [str(HERMES_PYTHON), "-c", script],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
         self.assertEqual(
             completed.returncode,
             0,
