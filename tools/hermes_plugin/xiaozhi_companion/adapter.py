@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextvars import ContextVar
+from dataclasses import dataclass
 import secrets
+import shutil
 from typing import Any, Callable, Dict, Optional
 
 from gateway.config import Platform
@@ -16,10 +20,19 @@ from gateway.platforms.base import (
 
 from .network import FileTokenResolver, ListenerConfig, ListenerPolicyError, WebsocketListener
 from .ogg_opus import packets_to_ogg_opus
-from .protocol import VoiceMessage, XiaozhiProtocolServer
+from .protocol import VoiceMessage, XiaozhiProtocolServer, XiaozhiSession
+from .response_text import response_preview
+from .tts_audio import load_tts_opus_packets
 
 
 PLATFORM_NAME = "xiaozhi_companion"
+
+
+@dataclass
+class VoiceResponseContext:
+    session: XiaozhiSession
+    speech_text: str = ""
+    tts_text_sent: bool = False
 
 
 def _bearer_token(value: str) -> str:
@@ -39,13 +52,21 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
         session_id_factory=None,
         ogg_serial_factory: Callable[[], int] | None = None,
         audio_cache: Callable[..., str] | None = None,
+        tts_audio_loader: Callable[..., tuple[bytes, ...]] | None = None,
     ):
         super().__init__(config=config, platform=Platform(PLATFORM_NAME))
         self._ogg_serial_factory = ogg_serial_factory or (
             lambda: secrets.randbits(32)
         )
         self._audio_cache = audio_cache or cache_audio_from_bytes
+        self._tts_audio_loader = tts_audio_loader or load_tts_opus_packets
+        self._voice_response_context: ContextVar[VoiceResponseContext | None] = ContextVar(
+            "xiaozhi_voice_response", default=None
+        )
         extra = getattr(config, "extra", {}) or {}
+        self._ffmpeg_executable = str(
+            extra.get("ffmpeg_executable", shutil.which("ffmpeg") or "ffmpeg")
+        )
         self._transport_mode = str(extra.get("transport", "")).strip().lower()
         self._listener = None
         if self._transport_mode == "wss":
@@ -97,12 +118,60 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        del reply_to, metadata
+        del reply_to
         session = self.protocol.active_session(str(chat_id))
         if session is None or not session.is_negotiated:
             return SendResult(success=False, error="companion session is not active")
+        context = self._voice_response_context.get()
+        is_final_response = bool(metadata and metadata.get("notify"))
+        if is_final_response:
+            if context is None or context.session is not session:
+                return SendResult(success=False, error="companion response session is stale")
+            if not context.tts_text_sent:
+                await session.send_emotion("neutral", text=response_preview(content))
+            return SendResult(success=True, message_id=session.session_id)
         await session.send_transcript(content)
         return SendResult(success=True, message_id=session.session_id)
+
+    def prepare_tts_text(self, text: str) -> str:
+        speech_text = super().prepare_tts_text(text)
+        context = self._voice_response_context.get()
+        if context is not None:
+            context.speech_text = speech_text
+        return speech_text
+
+    async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
+        del kwargs
+        context = self._voice_response_context.get()
+        session = self.protocol.active_session(str(chat_id))
+        if context is None or session is None or context.session is not session:
+            return SendResult(success=False, error="companion response session is stale")
+        if not context.speech_text:
+            return SendResult(success=False, error="companion response text is empty")
+        lifecycle_started = False
+        try:
+            packets = await asyncio.to_thread(
+                self._tts_audio_loader,
+                audio_path,
+                ffmpeg_executable=self._ffmpeg_executable,
+            )
+            if self.protocol.active_session(str(chat_id)) is not session:
+                return SendResult(success=False, error="companion response session is stale")
+            await session.start_tts()
+            lifecycle_started = True
+            await session.send_tts_sentence(response_preview(context.speech_text))
+            context.tts_text_sent = True
+            for packet in packets:
+                await session.send_tts_audio(packet)
+            await session.stop_tts()
+            return SendResult(success=True, message_id=session.session_id)
+        except Exception as exc:
+            if lifecycle_started and self.protocol.active_session(str(chat_id)) is session:
+                try:
+                    await session.stop_tts()
+                except Exception:
+                    pass
+            return SendResult(success=False, error=f"companion tts failed: {type(exc).__name__}")
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         del chat_id, metadata
@@ -141,8 +210,12 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
             user_id=recording.device_id,
             user_name="alain00",
         )
-        await self.handle_message(
-            MessageEvent(
+        session = self.protocol.active_session(recording.device_id)
+        if session is None or session.session_id != recording.session_id:
+            return
+        context_token = self._voice_response_context.set(VoiceResponseContext(session))
+        try:
+            await self.handle_message(MessageEvent(
                 text="[voice message]",
                 message_type=MessageType.VOICE,
                 source=source,
@@ -158,8 +231,9 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
                     "channels": recording.audio_params.channels,
                     "frame_duration": recording.audio_params.frame_duration,
                 },
-            )
-        )
+            ))
+        finally:
+            self._voice_response_context.reset(context_token)
 
 
 def check_requirements() -> bool:
