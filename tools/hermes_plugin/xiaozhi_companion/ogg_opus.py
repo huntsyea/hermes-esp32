@@ -17,7 +17,7 @@ class OggOpusError(ValueError):
     """Raised when packets cannot be represented by this bounded writer."""
 
 
-def _crc(payload: bytes) -> int:
+def ogg_crc32(payload: bytes) -> int:
     checksum = 0
     for byte in payload:
         checksum ^= byte << 24
@@ -59,7 +59,7 @@ def _page(
         + lacing
     )
     page = header + packet
-    struct.pack_into("<I", page, 22, _crc(page))
+    struct.pack_into("<I", page, 22, ogg_crc32(page))
     return bytes(page)
 
 

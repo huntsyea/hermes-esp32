@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable
 
-from .ogg_opus import _crc
+from .ogg_opus import ogg_crc32
 
 
 MAX_CONTAINER_BYTES = 8 * 1024 * 1024
@@ -94,7 +94,7 @@ def demux_ogg_opus(
             page = bytearray(container[offset:page_end])
             expected_crc = struct.unpack_from("<I", page, 22)[0]
             page[22:26] = b"\0\0\0\0"
-            if _crc(page) != expected_crc:
+            if ogg_crc32(page) != expected_crc:
                 raise TtsAudioError("ogg_checksum_mismatch")
         body_offset = header_end
         for lace in lacing:
@@ -149,10 +149,12 @@ def load_tts_opus_packets(
     if source_size <= 0 or source_size > max_container_bytes:
         raise TtsAudioError("audio_source_size_invalid")
     try:
-        source = path.read_bytes()
+        with path.open("rb") as source_file:
+            magic = source_file.read(4)
+            source = magic + source_file.read() if magic == b"OggS" else None
     except OSError as exc:
         raise TtsAudioError("audio_source_unavailable") from exc
-    if source.startswith(b"OggS"):
+    if source is not None:
         try:
             return demux_ogg_opus(source, max_container_bytes=max_container_bytes)
         except TtsAudioError as exc:
