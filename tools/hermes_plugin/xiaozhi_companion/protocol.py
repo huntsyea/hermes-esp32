@@ -70,6 +70,7 @@ class AuthenticationError(ProtocolError):
 VoiceMessageHandler = Callable[[VoiceMessage], Any | Awaitable[Any]]
 DiagnosticSink = Callable[[ProtocolDiagnostic], Any]
 SessionIdFactory = Callable[[], str]
+TokenResolver = Callable[[str], str | None]
 
 
 def _header(headers: Mapping[str, str], name: str) -> str:
@@ -86,16 +87,17 @@ class XiaozhiProtocolServer:
     def __init__(
         self,
         *,
-        expected_token: str,
+        expected_token: str | None = None,
+        token_resolver: TokenResolver | None = None,
         on_voice_message: VoiceMessageHandler,
         diagnostic_sink: DiagnosticSink | None = None,
         session_id_factory: SessionIdFactory | None = None,
         max_frame_bytes: int = 16 * 1024,
         max_recording_bytes: int = 4 * 1024 * 1024,
     ):
-        if not expected_token:
-            raise ValueError("expected_token_required")
-        self._expected_token = expected_token
+        if bool(expected_token) == bool(token_resolver):
+            raise ValueError("exactly_one_token_source_required")
+        self._token_resolver = token_resolver or (lambda _device_id: expected_token)
         self._on_voice_message = on_voice_message
         self._diagnostic_sink = diagnostic_sink
         self._session_id_factory = session_id_factory or (
@@ -111,11 +113,6 @@ class XiaozhiProtocolServer:
         transport: SessionTransport,
         headers: Mapping[str, str],
     ) -> "XiaozhiSession":
-        authorization = _header(headers, "Authorization")
-        if not hmac.compare_digest(authorization, self._expected_token):
-            self._diagnose("authentication_rejected")
-            raise AuthenticationError("authentication_rejected")
-
         if _header(headers, "Protocol-Version") != str(PROTOCOL_VERSION):
             self._diagnose("unsupported_version")
             raise ProtocolError("unsupported_version")
@@ -125,6 +122,15 @@ class XiaozhiProtocolServer:
         if not device_id or not client_id:
             self._diagnose("identity_required")
             raise ProtocolError("identity_required")
+
+        authorization = _header(headers, "Authorization")
+        expected_token = self._token_resolver(device_id)
+        comparison_token = expected_token or ("\0" * 32)
+        token_matches = hmac.compare_digest(authorization, comparison_token)
+        authenticated = bool(expected_token) and token_matches
+        if not authenticated:
+            self._diagnose("authentication_rejected")
+            raise AuthenticationError("authentication_rejected")
 
         session = XiaozhiSession(
             server=self,
@@ -138,8 +144,8 @@ class XiaozhiProtocolServer:
         async with self._open_lock:
             previous = self._sessions_by_device.get(device_id)
             self._sessions_by_device[device_id] = session
-            if previous is not None:
-                await previous._invalidate(4001, "replaced")
+        if previous is not None:
+            await previous._invalidate(4001, "replaced")
         self._diagnose("session_opened", session.session_id)
         return session
 
@@ -377,4 +383,3 @@ class XiaozhiSession:
     def _fail(self, code: str) -> None:
         self._server._diagnose(code, self.session_id)
         raise ProtocolError(code)
-

@@ -12,6 +12,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
+from .network import FileTokenResolver, ListenerConfig, ListenerPolicyError, WebsocketListener
 from .protocol import VoiceMessage, XiaozhiProtocolServer
 
 
@@ -31,15 +32,32 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
     def __init__(self, config, *, session_id_factory=None):
         super().__init__(config=config, platform=Platform(PLATFORM_NAME))
         extra = getattr(config, "extra", {}) or {}
-        token = _bearer_token(extra.get("token", ""))
-        if not token:
-            raise ValueError("xiaozhi_companion token is required")
         self._transport_mode = str(extra.get("transport", "")).strip().lower()
-        self.protocol = XiaozhiProtocolServer(
-            expected_token=token,
-            on_voice_message=self._handle_voice_message,
-            session_id_factory=session_id_factory,
-        )
+        self._listener = None
+        if self._transport_mode == "wss":
+            listener_config = ListenerConfig.from_extra(extra)
+            token_resolver = FileTokenResolver(extra.get("device_tokens_file", ""))
+            self.protocol = XiaozhiProtocolServer(
+                token_resolver=token_resolver,
+                on_voice_message=self._handle_voice_message,
+                session_id_factory=session_id_factory,
+            )
+            self._listener = WebsocketListener(listener_config, self.protocol)
+        elif self._transport_mode == "loopback":
+            token = _bearer_token(extra.get("token", ""))
+            if not token:
+                raise ValueError("xiaozhi_companion token is required")
+            self.protocol = XiaozhiProtocolServer(
+                expected_token=token,
+                on_voice_message=self._handle_voice_message,
+                session_id_factory=session_id_factory,
+            )
+            if bool(extra.get("listener_enabled", False)):
+                self._listener = WebsocketListener(
+                    ListenerConfig.from_extra(extra), self.protocol
+                )
+        else:
+            raise ListenerPolicyError("transport_must_be_wss_or_loopback")
 
     @property
     def name(self) -> str:
@@ -47,12 +65,14 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         del is_reconnect
-        if self._transport_mode != "loopback":
-            return False
+        if self._listener is not None:
+            await self._listener.start()
         self._mark_connected()
         return True
 
     async def disconnect(self) -> None:
+        if self._listener is not None:
+            await self._listener.stop()
         await self.protocol.disconnect_all()
         self._mark_disconnected()
 
@@ -119,14 +139,32 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
 
 
 def check_requirements() -> bool:
-    return True
+    try:
+        import websockets
+
+        major = int(websockets.__version__.split(".", 1)[0])
+        return major >= 15
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return False
 
 
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
-    return bool(str(extra.get("token", "")).strip()) and (
-        str(extra.get("transport", "")).strip().lower() == "loopback"
-    )
+    try:
+        transport = str(extra.get("transport", "")).strip().lower()
+        if transport == "loopback":
+            if not str(extra.get("token", "")).strip():
+                return False
+            if bool(extra.get("listener_enabled", False)):
+                ListenerConfig.from_extra(extra)
+            return True
+        if transport == "wss":
+            ListenerConfig.from_extra(extra)
+            FileTokenResolver(extra.get("device_tokens_file", ""))
+            return True
+        return False
+    except (ListenerPolicyError, OSError, ValueError):
+        return False
 
 
 def register(ctx) -> None:
@@ -137,7 +175,7 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         required_env=[],
-        install_hint="No additional Python packages are required for the protocol harness.",
+        install_hint="Requires websockets 15 or newer for the production WSS listener.",
         allowed_users_env="XIAOZHI_COMPANION_ALLOWED_DEVICES",
         allow_all_env="XIAOZHI_COMPANION_ALLOW_ALL_DEVICES",
         emoji="🫧",
