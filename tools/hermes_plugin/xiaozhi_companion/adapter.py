@@ -20,7 +20,7 @@ from gateway.platforms.base import (
 
 from .network import FileTokenResolver, ListenerConfig, ListenerPolicyError, WebsocketListener
 from .ogg_opus import packets_to_ogg_opus
-from .protocol import VoiceMessage, XiaozhiProtocolServer, XiaozhiSession
+from .protocol import ProtocolError, VoiceMessage, XiaozhiProtocolServer, XiaozhiSession
 from .response_text import response_preview
 from .tts_audio import load_tts_opus_packets
 
@@ -33,6 +33,11 @@ class VoiceResponseContext:
     session: XiaozhiSession
     speech_text: str = ""
     tts_text_sent: bool = False
+    interaction_generation: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.interaction_generation is None:
+            self.interaction_generation = self.session.interaction_generation
 
 
 def _bearer_token(value: str) -> str:
@@ -124,14 +129,26 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="companion session is not active")
         context = self._voice_response_context.get()
         is_final_response = bool(metadata and metadata.get("notify"))
-        if is_final_response:
-            if context is None or context.session is not session:
-                return SendResult(success=False, error="companion response session is stale")
-            if not context.tts_text_sent:
-                await session.send_emotion("neutral", text=response_preview(content))
+        try:
+            if is_final_response:
+                if not self._context_is_current(context, session):
+                    return SendResult(success=False, error="companion response session is stale")
+                if not context.tts_text_sent:
+                    await session.send_emotion(
+                        "neutral",
+                        text=response_preview(content),
+                        generation=context.interaction_generation,
+                    )
+                return SendResult(success=True, message_id=session.session_id)
+            generation = None
+            if context is not None:
+                if not self._context_is_current(context, session):
+                    return SendResult(success=False, error="companion response session is stale")
+                generation = context.interaction_generation
+            await session.send_transcript(content, generation=generation)
             return SendResult(success=True, message_id=session.session_id)
-        await session.send_transcript(content)
-        return SendResult(success=True, message_id=session.session_id)
+        except ProtocolError:
+            return SendResult(success=False, error="companion response session is stale")
 
     def prepare_tts_text(self, text: str) -> str:
         speech_text = super().prepare_tts_text(text)
@@ -144,31 +161,36 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
         del kwargs
         context = self._voice_response_context.get()
         session = self.protocol.active_session(str(chat_id))
-        if context is None or session is None or context.session is not session:
+        if not self._context_is_current(context, session):
             return SendResult(success=False, error="companion response session is stale")
         if not context.speech_text:
             return SendResult(success=False, error="companion response text is empty")
-        lifecycle_started = False
         try:
             packets = await asyncio.to_thread(
                 self._tts_audio_loader,
                 audio_path,
                 ffmpeg_executable=self._ffmpeg_executable,
             )
-            if self.protocol.active_session(str(chat_id)) is not session:
+            if not self._context_is_current(context, session):
                 return SendResult(success=False, error="companion response session is stale")
-            await session.start_tts()
-            lifecycle_started = True
-            await session.send_tts_sentence(response_preview(context.speech_text))
+            await session.start_tts(generation=context.interaction_generation)
+            await session.send_tts_sentence(
+                response_preview(context.speech_text),
+                generation=context.interaction_generation,
+            )
             context.tts_text_sent = True
             for packet in packets:
-                await session.send_tts_audio(packet)
-            await session.stop_tts()
+                await session.send_tts_audio(
+                    packet, generation=context.interaction_generation
+                )
+            await session.stop_tts(generation=context.interaction_generation)
             return SendResult(success=True, message_id=session.session_id)
         except Exception as exc:
-            if lifecycle_started and self.protocol.active_session(str(chat_id)) is session:
+            if self._context_is_current(context, session):
                 try:
-                    await session.stop_tts()
+                    await session.send_error(
+                        "tts", generation=context.interaction_generation
+                    )
                 except Exception:
                     pass
             return SendResult(success=False, error=f"companion tts failed: {type(exc).__name__}")
@@ -195,14 +217,31 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
         }
 
     async def _handle_voice_message(self, recording: VoiceMessage) -> None:
-        ogg_audio = packets_to_ogg_opus(
-            recording.frames,
-            serial=self._ogg_serial_factory(),
-            input_sample_rate=recording.audio_params.sample_rate,
-            channels=recording.audio_params.channels,
-            frame_duration_ms=recording.audio_params.frame_duration,
-        )
-        cached_audio = self._audio_cache(ogg_audio, ext=".ogg")
+        session = self.protocol.active_session(recording.device_id)
+        if (
+            session is None
+            or session.session_id != recording.session_id
+            or session.interaction_generation != recording.interaction_generation
+        ):
+            return
+        try:
+            ogg_audio = packets_to_ogg_opus(
+                recording.frames,
+                serial=self._ogg_serial_factory(),
+                input_sample_rate=recording.audio_params.sample_rate,
+                channels=recording.audio_params.channels,
+                frame_duration_ms=recording.audio_params.frame_duration,
+            )
+            cached_audio = self._audio_cache(ogg_audio, ext=".ogg")
+        except Exception:
+            if session.interaction_generation == recording.interaction_generation:
+                try:
+                    await session.send_error(
+                        "stt", generation=recording.interaction_generation
+                    )
+                except Exception:
+                    pass
+            return
         source = self.build_source(
             chat_id=recording.device_id,
             chat_name="alain00",
@@ -210,10 +249,10 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
             user_id=recording.device_id,
             user_name="alain00",
         )
-        session = self.protocol.active_session(recording.device_id)
-        if session is None or session.session_id != recording.session_id:
-            return
-        context_token = self._voice_response_context.set(VoiceResponseContext(session))
+        context = VoiceResponseContext(
+            session, interaction_generation=recording.interaction_generation
+        )
+        context_token = self._voice_response_context.set(context)
         try:
             await self.handle_message(MessageEvent(
                 text="[voice message]",
@@ -232,8 +271,29 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
                     "frame_duration": recording.audio_params.frame_duration,
                 },
             ))
+        except Exception:
+            if self._context_is_current(context, session):
+                try:
+                    await session.send_error(
+                        "agent", generation=context.interaction_generation
+                    )
+                except Exception:
+                    pass
         finally:
             self._voice_response_context.reset(context_token)
+
+    def _context_is_current(
+        self,
+        context: VoiceResponseContext | None,
+        session: XiaozhiSession | None,
+    ) -> bool:
+        return bool(
+            context is not None
+            and session is not None
+            and context.session is session
+            and self.protocol.active_session(session.device_id) is session
+            and context.interaction_generation == session.interaction_generation
+        )
 
 
 def check_requirements() -> bool:

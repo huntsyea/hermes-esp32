@@ -41,6 +41,7 @@ class VoiceMessage:
     client_id: str
     audio_params: AudioParameters
     frames: tuple[bytes, ...]
+    interaction_generation: int
 
 
 @dataclass(frozen=True)
@@ -204,6 +205,8 @@ class XiaozhiSession:
         self._negotiated = False
         self._listening = False
         self._tts_active = False
+        self._interaction_active = False
+        self._interaction_generation = 0
         self._frames: list[bytes] = []
         self._recording_bytes = 0
 
@@ -214,6 +217,14 @@ class XiaozhiSession:
     @property
     def is_negotiated(self) -> bool:
         return self._negotiated
+
+    @property
+    def interaction_active(self) -> bool:
+        return self._interaction_active
+
+    @property
+    def interaction_generation(self) -> int:
+        return self._interaction_generation
 
     async def receive_text(self, payload: str) -> None:
         self._assert_active()
@@ -238,6 +249,9 @@ class XiaozhiSession:
         if message_type == "listen":
             await self._handle_listen(message)
             return
+        if message_type == "abort":
+            self._handle_abort()
+            return
         if message_type == "hello":
             self._fail("duplicate_hello")
         self._fail("unsupported_message")
@@ -257,40 +271,67 @@ class XiaozhiSession:
         self._frames.append(payload)
         self._recording_bytes += len(payload)
 
-    async def send_transcript(self, text: str) -> None:
+    async def send_transcript(self, text: str, *, generation: int | None = None) -> None:
+        self._assert_interaction_generation(generation)
         await self._send_json("stt", text=str(text))
 
-    async def send_emotion(self, emotion: str, *, text: str | None = None) -> None:
+    async def send_emotion(
+        self,
+        emotion: str,
+        *,
+        text: str | None = None,
+        generation: int | None = None,
+    ) -> None:
+        self._assert_interaction_generation(generation)
         fields: dict[str, Any] = {"emotion": str(emotion)}
         if text is not None:
             fields["text"] = str(text)
         await self._send_json("llm", **fields)
 
-    async def start_tts(self) -> None:
+    async def start_tts(self, *, generation: int | None = None) -> None:
         self._assert_ready()
+        self._assert_interaction_generation(generation)
         if self._tts_active:
             self._fail("tts_already_active")
         self._tts_active = True
         await self._send_json("tts", state="start")
 
-    async def send_tts_sentence(self, text: str) -> None:
+    async def send_tts_sentence(
+        self, text: str, *, generation: int | None = None
+    ) -> None:
+        self._assert_interaction_generation(generation)
         if not self._tts_active:
             self._fail("tts_not_active")
         await self._send_json("tts", state="sentence_start", text=str(text))
 
-    async def send_tts_audio(self, payload: bytes) -> None:
+    async def send_tts_audio(
+        self, payload: bytes, *, generation: int | None = None
+    ) -> None:
         self._assert_ready()
+        self._assert_interaction_generation(generation)
         if not self._tts_active:
             self._fail("tts_not_active")
         if not isinstance(payload, bytes) or not payload:
             self._fail("invalid_audio_frame")
         await self._transport.send_binary(payload)
 
-    async def stop_tts(self) -> None:
+    async def stop_tts(self, *, generation: int | None = None) -> None:
+        self._assert_interaction_generation(generation)
         if not self._tts_active:
             self._fail("tts_not_active")
         await self._send_json("tts", state="stop")
         self._tts_active = False
+        self._interaction_active = False
+
+    async def send_error(self, code: str, *, generation: int | None = None) -> None:
+        safe_code = str(code).casefold()
+        if safe_code not in {"transport", "microphone", "speaker", "stt", "agent", "tts"}:
+            safe_code = "agent"
+        self._assert_interaction_generation(generation)
+        await self._send_json("error", code=safe_code)
+        self._tts_active = False
+        self._interaction_active = False
+        self._interaction_generation += 1
 
     async def disconnect(self) -> None:
         if not self._active:
@@ -298,6 +339,7 @@ class XiaozhiSession:
         self._active = False
         self._discard_recording()
         self._tts_active = False
+        self._interaction_active = False
         await self._server._release(self)
         self._server._diagnose("session_disconnected", self.session_id)
 
@@ -327,6 +369,8 @@ class XiaozhiSession:
                 self._fail("listen_already_active")
             if message.get("mode") != "manual":
                 self._fail("unsupported_listen_mode")
+            self._interaction_generation += 1
+            self._interaction_active = True
             self._listening = True
             self._frames.clear()
             self._recording_bytes = 0
@@ -348,11 +392,22 @@ class XiaozhiSession:
                     client_id=self.client_id,
                     audio_params=REQUIRED_AUDIO_PARAMETERS,
                     frames=frames,
+                    interaction_generation=self._interaction_generation,
                 )
             )
             self._server._diagnose("voice_message_emitted", self.session_id)
             return
         self._fail("unsupported_listen_state")
+
+    def _handle_abort(self) -> None:
+        if not (self._interaction_active or self._listening or self._tts_active):
+            self._server._diagnose("abort_ignored", self.session_id)
+            return
+        self._discard_recording()
+        self._tts_active = False
+        self._interaction_active = False
+        self._interaction_generation += 1
+        self._server._diagnose("session_aborted", self.session_id)
 
     async def _send_json(self, message_type: str, **fields: Any) -> None:
         self._assert_ready()
@@ -366,6 +421,7 @@ class XiaozhiSession:
         self._active = False
         self._discard_recording()
         self._tts_active = False
+        self._interaction_active = False
         await self._transport.close(code, reason)
         self._server._diagnose("session_invalidated", self.session_id)
 
@@ -381,6 +437,11 @@ class XiaozhiSession:
     def _assert_session_id(self, message: Mapping[str, Any]) -> None:
         if message.get("session_id") != self.session_id:
             self._fail("session_mismatch")
+
+    def _assert_interaction_generation(self, generation: int | None) -> None:
+        self._assert_ready()
+        if generation is not None and generation != self._interaction_generation:
+            self._fail("stale_interaction")
 
     def _discard_recording(self) -> None:
         self._listening = False

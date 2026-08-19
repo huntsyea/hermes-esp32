@@ -21,6 +21,13 @@ echoes. Whole-file TTS is validated as Ogg Opus or converted with a configured
 Only those packets are sent between the Xiaozhi `tts` start, sentence, and
 stop messages; Ogg headers never enter the device audio stream.
 
+Ticket 10 adds interruption recovery. A device `abort` discards partial input
+and active TTS without emitting a voice message. Each interaction has a
+generation, so cancelled or replaced work cannot send late transcript,
+lifecycle, or audio output. Recoverable STT, agent, and TTS failures return
+only a bounded category code; the next push-to-talk interaction can reuse the
+same authenticated connection.
+
 Production configuration uses `extra.transport: wss`. Set `bind_host`, `port`,
 and `path`, and set absolute external paths in `cert_file`, `key_file`, and
 `device_tokens_file`. The token file is a JSON object keyed by the exact
