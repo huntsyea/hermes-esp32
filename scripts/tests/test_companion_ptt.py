@@ -106,9 +106,9 @@ class PttProtocolBoundsTests(unittest.IsolatedAsyncioTestCase):
             "Client-Id": "client-1",
         }
 
-    async def test_empty_recording_does_not_emit_a_voice_message(self):
+    async def test_empty_recording_is_recoverable_and_does_not_emit_voice(self):
         from xiaozhi_companion.harness import ProtocolHarness
-        from xiaozhi_companion.protocol import ProtocolError, XiaozhiProtocolServer
+        from xiaozhi_companion.protocol import XiaozhiProtocolServer
 
         messages = []
         server = XiaozhiProtocolServer(
@@ -120,9 +120,18 @@ class PttProtocolBoundsTests(unittest.IsolatedAsyncioTestCase):
         await harness.connect()
         await harness.negotiate()
         await harness.start_listening()
-        with self.assertRaisesRegex(ProtocolError, "empty_recording"):
-            await harness.stop_listening()
+        generation = harness.session.interaction_generation
+        await harness.stop_listening()
         self.assertEqual(messages, [])
+        self.assertTrue(harness.session.is_active)
+        self.assertFalse(harness.session.interaction_active)
+        self.assertEqual(harness.session.interaction_generation, generation + 1)
+
+        await harness.start_listening()
+        await harness.send_audio(b"next-turn")
+        await harness.stop_listening()
+        await harness.session.wait_for_voice_processing()
+        self.assertEqual([message.frames for message in messages], [(b"next-turn",)])
 
     async def test_recording_frame_count_is_bounded(self):
         from xiaozhi_companion.harness import ProtocolHarness
@@ -209,6 +218,38 @@ class CompanionPttUiTests(unittest.TestCase):
         self.assertNotIn('ESP_LOGI(TAG, ">> %s"', application)
         self.assertNotIn('ESP_LOGI(TAG, "<< %s"', application)
 
+    def test_board_queues_ui_edges_and_cancels_ptt_before_main_task_cleanup(self):
+        board = (
+            ROOT
+            / "main"
+            / "boards"
+            / "waveshare"
+            / "esp32-s3-touch-lcd-1.54"
+            / "esp32-s3-touch-lcd-1.54.cc"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("kPendingConversationEventCapacity = 12", board)
+        self.assertIn("std::array<product_ui_event_t, kPendingConversationEventCapacity>", board)
+        self.assertNotIn("std::deque<PendingUiEvent>", board)
+        self.assertIn("QueueConversationEvent(product_event)", board)
+        self.assertIn("QueuePushToTalkEvent(active)", board)
+        self.assertIn("FlushPendingUiEventsLocked();", board)
+        self.assertIn("if (!clock_changed && !HasPendingUiEvents())", board)
+        self.assertIn("ReconcilePendingConversationEvents(event)", board)
+        self.assertIn("AppendPendingConversationEvent(PRODUCT_UI_EVENT_DISCONNECTED)", board)
+        self.assertIn('ESP_LOGW(TAG, "UI event queue full;', board)
+        self.assertIn('ESP_LOGE(TAG, "Failed to create Screen Manager")', board)
+        self.assertIn("pending_push_to_talk_state_ = active", board)
+        self.assertIn("has_pending_push_to_talk_state_ = true", board)
+
+        release_start = board.index("void ReleasePushToTalk()")
+        release_end = board.index("    void InitializePowerManager()", release_start)
+        release_body = board[release_start:release_end]
+        self.assertLess(
+            release_body.index("Application::GetInstance().StopListening();"),
+            release_body.index("Application::GetInstance().Schedule"),
+        )
+
 
 @unittest.skipUnless(
     HERMES_PYTHON.is_file()
@@ -249,9 +290,11 @@ async def main():
         ogg_serial_factory=lambda: 0x1234ABCD,
     )
     events = []
+    event_received = asyncio.Event()
 
     async def capture(event):
         events.append(event)
+        event_received.set()
 
     adapter.handle_message = capture
     await adapter.connect()
@@ -285,6 +328,8 @@ async def main():
         "type": "listen",
         "state": "stop",
     }))
+    await asyncio.wait_for(event_received.wait(), timeout=1)
+    await session.wait_for_voice_processing()
 
     assert len(events) == 1
     event = events[0]

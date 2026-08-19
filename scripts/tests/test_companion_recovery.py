@@ -110,6 +110,7 @@ class XiaozhiCancellationTests(unittest.IsolatedAsyncioTestCase):
         )
         await session.receive_binary(b"new")
         await session.receive_text(self.command(session, "listen", state="stop"))
+        await session.wait_for_voice_processing()
         self.assertEqual(len(self.voice_messages), 1)
         self.assertEqual(self.voice_messages[0].frames, (b"new",))
         await session.send_transcript(
@@ -232,6 +233,24 @@ class FirmwareRecoveryContractTests(unittest.TestCase):
         self.assertIn("RequiresConversationSessionId", source)
         self.assertIn("capture_stop_.Begin", source)
         self.assertIn("FinishListeningAfterCaptureDrain", source)
+        self.assertIn("ShouldCloseConversationOnNetworkLoss", source)
+        self.assertIn("protocol_->CloseAudioChannel(false)", source)
+        connecting_stop = source.split("void Application::HandleStopListeningEvent", 1)[1].split(
+            "void Application::HandleWakeWordDetectedEvent", 1
+        )[0]
+        self.assertIn("protocol_->CloseAudioChannel(false)", connecting_stop)
+
+    def test_protocol_callbacks_schedule_application_mutation(self):
+        source = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
+
+        closed = source.split("protocol_->OnAudioChannelClosed", 1)[1].split(
+            "protocol_->OnIncomingJson", 1
+        )[0]
+        self.assertIn("Schedule([this]", closed)
+        schedule_body = closed.split("Schedule([this]", 1)[1]
+        self.assertIn("SetPowerSaveLevel", schedule_body)
+        self.assertIn("conversation_session_.Close()", schedule_body)
+        self.assertIn("tts_downlink_.Stop()", schedule_body)
 
     def test_websocket_rejects_malformed_audio_bounds_and_tags_session(self):
         protocol = (ROOT / "main" / "protocols" / "websocket_protocol.cc").read_text(
@@ -295,6 +314,7 @@ async def record(session, payload=b"opus"):
     await session.receive_text(command(session, "listen", state="start", mode="manual"))
     await session.receive_binary(payload)
     await session.receive_text(command(session, "listen", state="stop"))
+    await session.wait_for_voice_processing()
 
 
 async def main():
@@ -326,15 +346,20 @@ async def main():
     }))
 
     provider_started = asyncio.Event()
+    provider_cancelled = asyncio.Event()
     provider_release = asyncio.Event()
     provider_results = []
 
     async def delayed_provider(_event):
         provider_started.set()
-        await provider_release.wait()
-        provider_results.append(await adapter.send(
-            "device-1", "private late response", metadata={"notify": True}
-        ))
+        try:
+            await provider_release.wait()
+            provider_results.append(await adapter.send(
+                "device-1", "private late response", metadata={"notify": True}
+            ))
+        except asyncio.CancelledError:
+            provider_cancelled.set()
+            raise
 
     adapter.handle_message = delayed_provider
     await session.receive_text(command(session, "listen", state="start", mode="manual"))
@@ -344,9 +369,10 @@ async def main():
     )
     await provider_started.wait()
     await session.receive_text(command(session, "abort"))
+    await asyncio.wait_for(provider_cancelled.wait(), timeout=1)
     provider_release.set()
     await stop_task
-    assert provider_results and not provider_results[0].success
+    assert not provider_results
     assert not any("private late response" in json.dumps(item) for item in transport.json_messages)
 
     async def failing_agent(_event):
@@ -365,6 +391,7 @@ async def main():
     generation = session.interaction_generation
     await session.receive_binary(b"tts")
     await session.receive_text(command(session, "listen", state="stop"))
+    await session.wait_for_voice_processing()
     token = adapter._voice_response_context.set(
         VoiceResponseContext(session, interaction_generation=generation)
     )
@@ -403,6 +430,112 @@ asyncio.run(main())
             check=False,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_abort_removes_cache_file_written_by_in_flight_worker(self):
+        script = r'''
+import asyncio
+import json
+import sys
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+from gateway.platform_registry import PlatformEntry, platform_registry
+from xiaozhi_companion.loopback import LoopbackTransport
+
+
+class Context:
+    def register_platform(self, **kwargs):
+        platform_registry.register(PlatformEntry(source="plugin", **kwargs))
+
+
+def command(session, message_type, **fields):
+    return json.dumps({"session_id": session.session_id, "type": message_type, **fields})
+
+
+async def main(cache_path):
+    import xiaozhi_companion
+
+    xiaozhi_companion.register(Context())
+    from xiaozhi_companion.adapter import XiaozhiCompanionAdapter
+
+    written = threading.Event()
+    release = threading.Event()
+    events = []
+
+    def delayed_cache(data, *, ext):
+        del ext
+        Path(cache_path).write_bytes(data)
+        written.set()
+        release.wait(timeout=2)
+        return cache_path
+
+    adapter = XiaozhiCompanionAdapter(
+        SimpleNamespace(extra={"token": "test-token", "transport": "loopback"}),
+        session_id_factory=lambda: "cache-session",
+        ogg_serial_factory=lambda: 11,
+        audio_cache=delayed_cache,
+    )
+
+    async def capture(event):
+        events.append(event)
+
+    adapter.handle_message = capture
+    transport = LoopbackTransport()
+    session = await adapter.protocol.open_session(
+        transport,
+        {
+            "Authorization": "Bearer test-token",
+            "Protocol-Version": "1",
+            "Device-Id": "device-1",
+            "Client-Id": "client-1",
+        },
+    )
+    await session.receive_text(json.dumps({
+        "type": "hello", "version": 1, "transport": "websocket",
+        "audio_params": {"format": "opus", "sample_rate": 16000,
+                         "channels": 1, "frame_duration": 60},
+    }))
+    await session.receive_text(command(session, "listen", state="start", mode="manual"))
+    await session.receive_binary(b"private-audio")
+    await session.receive_text(command(session, "listen", state="stop"))
+    assert await asyncio.to_thread(written.wait, 1)
+
+    await session.receive_text(command(session, "abort"))
+    release.set()
+    for _ in range(100):
+        if not Path(cache_path).exists():
+            break
+        await asyncio.sleep(0.01)
+    assert not Path(cache_path).exists()
+    assert events == []
+    await adapter.disconnect()
+
+
+asyncio.run(main(sys.argv[1]))
+print("cancelled-cache-cleanup-ok")
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "cancelled-recording.ogg"
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = os.pathsep.join(
+                (str(PLUGIN_PARENT), str(HERMES_ROOT), environment.get("PYTHONPATH", ""))
+            )
+            completed = subprocess.run(
+                [str(HERMES_PYTHON), "-c", script, str(cache_path)],
+                cwd=HERMES_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"{completed.stdout}\n{completed.stderr}",
+        )
+        self.assertIn("cancelled-cache-cleanup-ok", completed.stdout)
 
 
 if __name__ == "__main__":

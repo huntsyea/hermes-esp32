@@ -22,6 +22,79 @@ sys.path.insert(0, str(PLUGIN_PARENT))
 
 
 class TtsAudioTests(unittest.TestCase):
+    def test_tts_ingress_publish_is_atomic_with_stop_completion(self):
+        source = textwrap.dedent(
+            r"""
+            #include <atomic>
+            #include <cassert>
+            #include <condition_variable>
+            #include <mutex>
+            #include <thread>
+            #include "main/audio_downlink_gate.h"
+
+            int main() {
+              AudioDownlinkGate gate;
+              gate.Start();
+              std::mutex ingress_mutex;
+              std::mutex step_mutex;
+              std::condition_variable step;
+              std::atomic<bool> accepted{false};
+              std::atomic<bool> stop_started{false};
+              bool queued = false;
+              bool finished = false;
+
+              std::thread ingress([&] {
+                std::lock_guard<std::mutex> lock(ingress_mutex);
+                accepted = gate.Accept(true);
+                {
+                  std::lock_guard<std::mutex> step_lock(step_mutex);
+                  step.notify_all();
+                }
+                while (!stop_started) {
+                  std::this_thread::yield();
+                }
+                if (accepted) {
+                  queued = true;
+                }
+              });
+              std::thread stop([&] {
+                std::unique_lock<std::mutex> step_lock(step_mutex);
+                step.wait(step_lock, [&] { return accepted.load(); });
+                gate.Stop();
+                stop_started = true;
+                step_lock.unlock();
+                std::lock_guard<std::mutex> lock(ingress_mutex);
+                finished = !queued;
+              });
+
+              ingress.join();
+              stop.join();
+              assert(accepted);
+              assert(queued);
+              assert(!finished);
+              return 0;
+            }
+            """
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cpp = Path(directory) / "tts_ingress_race.cc"
+            binary = Path(directory) / "tts_ingress_race"
+            cpp.write_text(source, encoding="utf-8")
+            subprocess.run(
+                [
+                    "c++",
+                    "-std=c++17",
+                    "-pthread",
+                    "-I",
+                    str(ROOT),
+                    str(cpp),
+                    "-o",
+                    str(binary),
+                ],
+                check=True,
+            )
+            subprocess.run([str(binary)], timeout=10, check=True)
+
     def test_response_preview_is_utf8_safe_and_bounded(self):
         from xiaozhi_companion.response_text import response_preview
 
@@ -153,9 +226,26 @@ class PlaybackEnvelopeTests(unittest.TestCase):
         self.assertIn("pending_tts_stop_", application)
         self.assertIn("FinishTtsPlayback", application)
         self.assertIn("MAIN_EVENT_PLAYBACK_DRAINED", application)
+        self.assertIn("MAIN_EVENT_INCOMING_AUDIO", application)
+        self.assertIn("pending_tts_start_epoch_", application)
+        self.assertIn("HasPendingTtsPackets(epoch)", application)
         self.assertIn("tts_downlink_.Start()", application)
         self.assertIn("tts_downlink_.Accept", application)
-        self.assertIn("PushPacketToDecodeQueue(std::move(packet), true)", application)
+        self.assertIn("kMaxPendingTtsPackets", application)
+        self.assertIn("conversation_session_.Matches(pending.session_id, pending.epoch)", application)
+        self.assertIn("PushPacketToDecodeQueue(std::move(pending.packet), false)", application)
+        self.assertNotIn("PushPacketToDecodeQueue(std::move(packet), true)", application)
+        ingress = application.split("protocol_->OnIncomingAudio", 1)[1].split(
+            "protocol_->OnAudioChannelOpened", 1
+        )[0]
+        self.assertLess(
+            ingress.index("std::lock_guard<std::mutex> lock(mutex_)"),
+            ingress.index("tts_downlink_.Accept(true)"),
+        )
+        drain = application.split("void Application::DrainPendingTtsPackets", 1)[1].split(
+            "void Application::ClearPendingTtsPackets", 1
+        )[0]
+        self.assertNotIn("tts_downlink_.Accept", drain)
         self.assertIn("on_playback_envelope", audio)
         self.assertIn("CalculatePlaybackEnvelope", audio)
         self.assertIn("SetPlaybackEnvelope", display)

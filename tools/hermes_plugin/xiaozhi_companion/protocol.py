@@ -204,11 +204,13 @@ class XiaozhiSession:
         self._active = True
         self._negotiated = False
         self._listening = False
+        self._discarding_audio = False
         self._tts_active = False
         self._interaction_active = False
         self._interaction_generation = 0
         self._frames: list[bytes] = []
         self._recording_bytes = 0
+        self._voice_task: asyncio.Task[None] | None = None
 
     @property
     def is_active(self) -> bool:
@@ -225,6 +227,12 @@ class XiaozhiSession:
     @property
     def interaction_generation(self) -> int:
         return self._interaction_generation
+
+    async def wait_for_voice_processing(self) -> None:
+        """Wait for the current recording handler without transferring ownership."""
+        task = self._voice_task
+        if task is not None:
+            await asyncio.shield(task)
 
     async def receive_text(self, payload: str) -> None:
         self._assert_active()
@@ -250,7 +258,7 @@ class XiaozhiSession:
             await self._handle_listen(message)
             return
         if message_type == "abort":
-            self._handle_abort()
+            await self._handle_abort()
             return
         if message_type == "hello":
             self._fail("duplicate_hello")
@@ -258,12 +266,14 @@ class XiaozhiSession:
 
     async def receive_binary(self, payload: bytes) -> None:
         self._assert_ready()
-        if not self._listening:
-            self._fail("listen_not_active")
         if not isinstance(payload, bytes) or not payload:
             self._fail("invalid_audio_frame")
         if len(payload) > self._max_frame_bytes:
             self._fail("audio_frame_too_large")
+        if self._discarding_audio:
+            return
+        if not self._listening:
+            self._fail("listen_not_active")
         if self._recording_bytes + len(payload) > self._max_recording_bytes:
             self._fail("recording_too_large")
         if len(self._frames) >= self._max_recording_frames:
@@ -337,6 +347,7 @@ class XiaozhiSession:
         if not self._active:
             return
         self._active = False
+        await self._cancel_voice_task()
         self._discard_recording()
         self._tts_active = False
         self._interaction_active = False
@@ -367,9 +378,19 @@ class XiaozhiSession:
         if state == "start":
             if self._listening:
                 self._fail("listen_already_active")
-            if message.get("mode") != "manual":
+            mode = message.get("mode")
+            if mode not in {"manual", "auto", "realtime"}:
                 self._fail("unsupported_listen_mode")
             self._interaction_generation += 1
+            self._interaction_active = False
+            self._tts_active = False
+            self._discarding_audio = False
+            await self._cancel_voice_task()
+            if mode != "manual":
+                self._discarding_audio = True
+                await self._send_json("error", code="agent")
+                self._server._diagnose("listen_mode_rejected", self.session_id)
+                return
             self._interaction_active = True
             self._listening = True
             self._frames.clear()
@@ -377,6 +398,10 @@ class XiaozhiSession:
             self._server._diagnose("listen_started", self.session_id)
             return
         if state == "stop":
+            if self._discarding_audio:
+                self._discarding_audio = False
+                self._server._diagnose("rejected_listen_stopped", self.session_id)
+                return
             if not self._listening:
                 self._fail("listen_not_active")
             frames = tuple(self._frames)
@@ -384,8 +409,11 @@ class XiaozhiSession:
             self._frames.clear()
             self._recording_bytes = 0
             if not frames:
-                self._fail("empty_recording")
-            await self._server._emit_voice_message(
+                self._interaction_active = False
+                self._interaction_generation += 1
+                self._server._diagnose("empty_recording", self.session_id)
+                return
+            self._start_voice_task(
                 VoiceMessage(
                     session_id=self.session_id,
                     device_id=self.device_id,
@@ -395,18 +423,24 @@ class XiaozhiSession:
                     interaction_generation=self._interaction_generation,
                 )
             )
-            self._server._diagnose("voice_message_emitted", self.session_id)
+            self._server._diagnose("voice_message_dispatched", self.session_id)
             return
         self._fail("unsupported_listen_state")
 
-    def _handle_abort(self) -> None:
-        if not (self._interaction_active or self._listening or self._tts_active):
+    async def _handle_abort(self) -> None:
+        if not (
+            self._interaction_active
+            or self._listening
+            or self._discarding_audio
+            or self._tts_active
+        ):
             self._server._diagnose("abort_ignored", self.session_id)
             return
         self._discard_recording()
         self._tts_active = False
         self._interaction_active = False
         self._interaction_generation += 1
+        await self._cancel_voice_task()
         self._server._diagnose("session_aborted", self.session_id)
 
     async def _send_json(self, message_type: str, **fields: Any) -> None:
@@ -419,11 +453,49 @@ class XiaozhiSession:
         if not self._active:
             return
         self._active = False
+        await self._cancel_voice_task()
         self._discard_recording()
         self._tts_active = False
         self._interaction_active = False
         await self._transport.close(code, reason)
         self._server._diagnose("session_invalidated", self.session_id)
+
+    def _start_voice_task(self, message: VoiceMessage) -> None:
+        if self._voice_task is not None:
+            self._fail("voice_processing_active")
+        task = asyncio.create_task(self._process_voice_message(message))
+        self._voice_task = task
+        task.add_done_callback(self._voice_task_completed)
+
+    async def _process_voice_message(self, message: VoiceMessage) -> None:
+        try:
+            await self._server._emit_voice_message(message)
+        except asyncio.CancelledError:
+            self._server._diagnose("voice_processing_cancelled", self.session_id)
+            raise
+        except Exception:
+            self._server._diagnose("voice_processing_failed", self.session_id)
+
+    def _voice_task_completed(self, task: asyncio.Task[None]) -> None:
+        if self._voice_task is task:
+            self._voice_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+
+    async def _cancel_voice_task(self) -> None:
+        task = self._voice_task
+        if task is None:
+            return
+        self._voice_task = None
+        if task is asyncio.current_task():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     def _assert_active(self) -> None:
         if not self._active:
@@ -445,6 +517,7 @@ class XiaozhiSession:
 
     def _discard_recording(self) -> None:
         self._listening = False
+        self._discarding_audio = False
         self._frames.clear()
         self._recording_bytes = 0
 

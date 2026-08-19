@@ -26,13 +26,20 @@ and active TTS without emitting a voice message. Each interaction has a
 generation, so cancelled or replaced work cannot send late transcript,
 lifecycle, or audio output. Recoverable STT, agent, and TTS failures return
 only a bounded category code; the next push-to-talk interaction can reuse the
-same authenticated connection.
+same authenticated connection. Completed recordings run in one tracked task
+owned by the device session. Abort, disconnect, replacement, and a new turn
+cancel and consume that task without blocking listener ingress. Empty captures
+end the current interaction without closing the transport. This adapter supports
+`manual` push-to-talk capture. It rejects `auto` and `realtime` modes with a
+bounded device error while keeping the authenticated transport usable.
 
 Production configuration uses `extra.transport: wss`. Set `bind_host`, `port`,
 and `path`, and set absolute external paths in `cert_file`, `key_file`, and
 `device_tokens_file`. The token file is a JSON object keyed by the exact
 `Device-Id`. Values may contain a complete bearer value or a raw token. Keep
 the certificate private key and tokens outside this repository.
+Configuration validation parses the certificate and key together, so malformed
+PEM data or a certificate-key mismatch is rejected before listener startup.
 Set `ffmpeg_executable` only when `ffmpeg` is not available on the Hermes
 service PATH.
 

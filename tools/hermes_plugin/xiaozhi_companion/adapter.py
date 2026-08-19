@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 import secrets
 import shutil
 from typing import Any, Callable, Dict, Optional
@@ -18,7 +19,13 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
 )
 
-from .network import FileTokenResolver, ListenerConfig, ListenerPolicyError, WebsocketListener
+from .network import (
+    FileTokenResolver,
+    ListenerConfig,
+    ListenerPolicyError,
+    WebsocketListener,
+    build_server_ssl_context,
+)
 from .ogg_opus import packets_to_ogg_opus
 from .protocol import ProtocolError, VoiceMessage, XiaozhiProtocolServer, XiaozhiSession
 from .response_text import response_preview
@@ -225,14 +232,27 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
         ):
             return
         try:
-            ogg_audio = packets_to_ogg_opus(
+            ogg_audio = await asyncio.to_thread(
+                packets_to_ogg_opus,
                 recording.frames,
                 serial=self._ogg_serial_factory(),
                 input_sample_rate=recording.audio_params.sample_rate,
                 channels=recording.audio_params.channels,
                 frame_duration_ms=recording.audio_params.frame_duration,
             )
-            cached_audio = self._audio_cache(ogg_audio, ext=".ogg")
+            if not self._recording_is_current(recording, session):
+                return
+            cache_task = asyncio.create_task(
+                asyncio.to_thread(self._audio_cache, ogg_audio, ext=".ogg")
+            )
+            try:
+                cached_audio = await asyncio.shield(cache_task)
+            except asyncio.CancelledError:
+                cache_task.add_done_callback(self._discard_cache_task_result)
+                raise
+            if not self._recording_is_current(recording, session):
+                self._discard_cached_audio(cached_audio)
+                return
         except Exception:
             if session.interaction_generation == recording.interaction_generation:
                 try:
@@ -282,6 +302,31 @@ class XiaozhiCompanionAdapter(BasePlatformAdapter):
         finally:
             self._voice_response_context.reset(context_token)
 
+    @staticmethod
+    def _discard_cached_audio(path: str) -> None:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    def _discard_cache_task_result(self, task: asyncio.Task[str]) -> None:
+        try:
+            cached_audio = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+        self._discard_cached_audio(cached_audio)
+
+    def _recording_is_current(
+        self, recording: VoiceMessage, session: XiaozhiSession
+    ) -> bool:
+        return bool(
+            self.protocol.active_session(recording.device_id) is session
+            and session.session_id == recording.session_id
+            and session.interaction_generation == recording.interaction_generation
+        )
+
     def _context_is_current(
         self,
         context: VoiceResponseContext | None,
@@ -317,7 +362,8 @@ def validate_config(config) -> bool:
                 ListenerConfig.from_extra(extra)
             return True
         if transport == "wss":
-            ListenerConfig.from_extra(extra)
+            listener_config = ListenerConfig.from_extra(extra)
+            build_server_ssl_context(listener_config)
             FileTokenResolver(extra.get("device_tokens_file", ""))
             return True
         return False

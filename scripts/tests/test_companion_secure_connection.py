@@ -360,7 +360,140 @@ class CompanionDevicePolicyTests(unittest.TestCase):
         self.assertIn("reconnect_.RecordFailure", websocket)
         self.assertIn("reconnect_.RecordSuccess", websocket)
         self.assertIn("secure_websocket", websocket)
-        self.assertIn("!intentional_close_ && on_disconnected_", websocket)
+        self.assertIn("!intentional_close_.load() && on_disconnected_", websocket)
+
+    def test_physical_websocket_connects_off_main_task_with_bounded_tx(self):
+        websocket = (ROOT / "main" / "protocols" / "websocket_protocol.cc").read_text(
+            encoding="utf-8"
+        )
+        secure = (
+            ROOT / "main" / "protocols" / "secure_websocket_client.cc"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("StartSecureConnection", websocket)
+        self.assertIn("StartSecureShutdown", websocket)
+        self.assertIn("DeferSecureShutdown(std::move(secure))", websocket)
+        self.assertIn("xTaskCreate", websocket)
+        self.assertIn("FinishSecureConnection", websocket)
+        self.assertIn("context.reset()", websocket)
+        self.assertIn("kSendTimeout", secure)
+        self.assertNotIn("pdMS_TO_TICKS(10000))", secure.split("bool SecureWebSocketClient::Send", 1)[1])
+        cancel = secure.split("void SecureWebSocketClient::Cancel()", 1)[1].split(
+            "bool SecureWebSocketClient::IsConnected", 1
+        )[0]
+        self.assertNotIn("Shutdown()", cancel)
+        send = secure.split("bool SecureWebSocketClient::Send(const void*", 1)[1].split(
+            "void SecureWebSocketClient::HandleEvent", 1
+        )[0]
+        self.assertIn("cancelled_.load()", send)
+        self.assertIn("secure_connection_lifecycle_mutex_", websocket)
+
+    def test_secure_close_linearizes_hello_send_and_connected_publish(self):
+        source = textwrap.dedent(
+            r"""
+            #include <atomic>
+            #include <cassert>
+            #include <mutex>
+            #include <thread>
+
+            class ConnectionLifecycle {
+             public:
+              bool SendHello(unsigned expected_generation) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (generation_ != expected_generation || cancelled_) {
+                  return false;
+                }
+                assert(!close_returned_.load());
+                hello_sent_ = true;
+                return true;
+              }
+
+              bool PublishConnected(unsigned expected_generation) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (generation_ != expected_generation || cancelled_) {
+                  return false;
+                }
+                assert(!close_returned_.load());
+                connected_ = true;
+                return true;
+              }
+
+              void Close() {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ++generation_;
+                cancelled_ = true;
+                connected_ = false;
+                close_returned_.store(true);
+              }
+
+              bool connected() const { return connected_; }
+
+             private:
+              std::mutex mutex_;
+              unsigned generation_ = 1;
+              bool cancelled_ = false;
+              bool hello_sent_ = false;
+              bool connected_ = false;
+              std::atomic<bool> close_returned_{false};
+            };
+
+            int main() {
+              for (int iteration = 0; iteration < 1000; ++iteration) {
+                ConnectionLifecycle lifecycle;
+                std::thread worker([&] {
+                  lifecycle.SendHello(1);
+                  std::this_thread::yield();
+                  lifecycle.PublishConnected(1);
+                });
+                std::thread closer([&] { lifecycle.Close(); });
+                worker.join();
+                closer.join();
+                assert(!lifecycle.connected());
+              }
+              return 0;
+            }
+            """
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cpp = Path(directory) / "secure_lifecycle_race.cc"
+            executable = Path(directory) / "secure_lifecycle_race"
+            cpp.write_text(source, encoding="utf-8")
+            subprocess.run(
+                ["c++", "-std=c++17", "-pthread", str(cpp), "-o", str(executable)],
+                check=True,
+            )
+            subprocess.run([str(executable)], timeout=10, check=True)
+
+    def test_network_error_mutation_is_scheduled_on_application_task(self):
+        application = (ROOT / "main" / "application.cc").read_text(encoding="utf-8")
+        handler = application.split("protocol_->OnNetworkError", 1)[1].split(
+            "protocol_->OnIncomingAudio", 1
+        )[0]
+        self.assertIn("Schedule([this, message]", handler)
+
+    def test_legacy_hello_stays_permissive_and_strict_mode_requires_identity(self):
+        websocket = (ROOT / "main" / "protocols" / "websocket_protocol.cc").read_text(
+            encoding="utf-8"
+        )
+
+        hello = websocket.split("void WebsocketProtocol::ParseServerHello", 1)[1]
+        self.assertIn("strict_session_validation_", hello)
+        self.assertIn("legacy-", hello)
+        self.assertIn("synthesized_legacy_session_", websocket)
+        self.assertIn('\\"session_id\\":\\"\\"', websocket)
+        self.assertIn("if (cJSON_IsObject(audio_params))", hello)
+
+    def test_generation_changes_after_reconnect_policy_accepts_attempt(self):
+        websocket = (ROOT / "main" / "protocols" / "websocket_protocol.cc").read_text(
+            encoding="utf-8"
+        )
+
+        open_channel = websocket.split("bool WebsocketProtocol::OpenAudioChannel()", 1)[1].split(
+            "bool WebsocketProtocol::IsTransportConnected", 1
+        )[0]
+        self.assertLess(open_channel.index("reconnect_.Ready()"), open_channel.index("transport_generation_"))
+        active_attempt = open_channel.split("IsSecureConnectionTaskActive()", 1)[1].split("}", 1)[0]
+        self.assertIn("return false", active_attempt)
 
 
 @unittest.skipUnless(
@@ -417,6 +550,111 @@ print("secure-plugin-doctor-ok")
             msg=f"{completed.stdout}\n{completed.stderr}",
         )
         self.assertIn("secure-plugin-doctor-ok", completed.stdout)
+
+    def test_validate_config_parses_tls_material_and_rejects_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def generate_pair(name):
+                cert = root / f"{name}.pem"
+                key = root / f"{name}.key"
+                completed = subprocess.run(
+                    [
+                        "openssl",
+                        "req",
+                        "-x509",
+                        "-newkey",
+                        "rsa:2048",
+                        "-nodes",
+                        "-days",
+                        "1",
+                        "-subj",
+                        "/CN=localhost",
+                        "-keyout",
+                        str(key),
+                        "-out",
+                        str(cert),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+                return cert, key
+
+            cert, key = generate_pair("server")
+            _other_cert, other_key = generate_pair("other")
+            malformed_cert = root / "malformed.pem"
+            malformed_cert.write_text("not a certificate", encoding="utf-8")
+            tokens = root / "device-tokens.json"
+            tokens.write_text(json.dumps({"device-1": "secret"}), encoding="utf-8")
+
+            script = r'''
+import importlib
+import sys
+from types import SimpleNamespace
+
+from gateway.platform_registry import PlatformEntry
+
+
+class Context:
+    def __init__(self):
+        self.entry = None
+
+    def register_platform(self, **kwargs):
+        self.entry = PlatformEntry(source="plugin", **kwargs)
+
+
+module = importlib.import_module("xiaozhi_companion")
+context = Context()
+module.register(context)
+
+
+def config(cert, key):
+    return SimpleNamespace(extra={
+        "transport": "wss",
+        "bind_host": "127.0.0.1",
+        "port": 0,
+        "cert_file": cert,
+        "key_file": key,
+        "device_tokens_file": sys.argv[4],
+    })
+
+
+assert context.entry.validate_config(config(sys.argv[1], sys.argv[2]))
+assert not context.entry.validate_config(config(sys.argv[3], sys.argv[2]))
+assert not context.entry.validate_config(config(sys.argv[1], sys.argv[5]))
+print("tls-preflight-ok")
+'''
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = os.pathsep.join(
+                (str(PLUGIN_PARENT), str(HERMES_ROOT))
+            )
+            completed = subprocess.run(
+                [
+                    str(HERMES_PYTHON),
+                    "-c",
+                    script,
+                    str(cert),
+                    str(key),
+                    str(malformed_cert),
+                    str(tokens),
+                    str(other_key),
+                ],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=f"{completed.stdout}\n{completed.stderr}",
+            )
+            self.assertIn("tls-preflight-ok", completed.stdout)
 
     def test_ephemeral_wss_listener_negotiates_and_rejects_wrong_device_token(self):
         with tempfile.TemporaryDirectory() as directory:
