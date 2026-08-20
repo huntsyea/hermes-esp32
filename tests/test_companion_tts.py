@@ -11,8 +11,8 @@ import wave
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[2]
-PLUGIN_PARENT = ROOT / "tools" / "hermes_plugin"
+ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_PARENT = ROOT
 HERMES_ROOT = Path(
     os.environ.get("HERMES_AGENT_ROOT", Path.home() / ".hermes" / "hermes-agent")
 )
