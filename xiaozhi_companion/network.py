@@ -14,7 +14,7 @@ from .protocol import AuthenticationError, ProtocolError, XiaozhiProtocolServer
 
 DEFAULT_PORT = 8765
 DEFAULT_PATH = "/xiaozhi/v1"
-REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ListenerPolicyError(ValueError):
