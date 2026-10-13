@@ -14,10 +14,12 @@
 set -euo pipefail
 
 MINI_HOST="${MINI_HOST:-mac-mini}"
-PLUGIN_PATH="~/.hermes/plugins/hermes-esp32"
-HERMES_PYTHON="~/.hermes/hermes-agent/venv/bin/python"
+# Remote paths stay unexpanded here so the mini's shell resolves ~.
+HERMES_HOME="${HERMES_HOME:-~/.hermes}"
+PLUGIN_PATH="${HERMES_HOME}/plugins/hermes-esp32"
+HERMES_PYTHON="${HERMES_HOME}/hermes-agent/venv/bin/python"
 GATEWAY_LABEL="ai.hermes.gateway"
-GATEWAY_LOG="~/.hermes/logs/gateway.log"
+GATEWAY_LOG="${HERMES_HOME}/logs/gateway.log"
 
 RESTART=1
 ALLOW_DIRTY=0
